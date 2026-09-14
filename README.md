@@ -22,25 +22,15 @@ Extension updates install into a fresh directory, so re-run the patch after ever
 
 ## Usage
 
-Extension updates install into a fresh directory, so after every auto-update, check before patching:
-
-```bash
-python3 scripts/check.py
-```
-
-This is read-only — it reports, per fix, whether the pattern is `already patched`, `found (patchable)`, or `NOT FOUND`, without touching any files. It calls `patch.py`'s own `patch_lock`/`patch_column`/`patch_focus` functions on a throwaway copy of the source (never written back), so it can't silently drift out of sync with what the real patch matches.
-
-That's the only command you need to run. If everything says `already patched` or `found (patchable)`, go ahead and run `patch.py` (next section). If anything says `NOT FOUND`, the extension bundle changed shape and `patch.py`'s patterns need updating first — `check.py` has already copied the affected file(s) into this repo's git-ignored `tmp/` directory (Claude Code's sandbox can't read `~/.vscode/extensions`/`~/.cursor/extensions` directly, but it *can* read this repo), so there's nothing to paste — just tell Claude a pattern wasn't found and it can take it from there.
-
-(`scripts/sync_tmp.py` does the same file-copying step manually for every install regardless of pass/fail, if you ever want a full refresh in `tmp/` without waiting for a failure.)
-
-Once `check.py` looks clean, apply the patch:
+Just run it — after every auto-update, or any time you want to double check:
 
 ```bash
 python3 scripts/patch.py
 ```
 
-This finds every `anthropic.claude-code-*` install under `~/.cursor/extensions` and `~/.vscode/extensions` and applies the lock + column fixes to `extension.js` and the focus fix to `webview/index.js`. Already-patched pieces are skipped. Before its first write to a given file, it's backed up to `<name>.bak` (never overwritten once it exists), and the script's output tells you where the backup is and how to restore it.
+This finds every `anthropic.claude-code-*` install under `~/.cursor/extensions` and `~/.vscode/extensions` and applies the lock + column fixes to `extension.js` and the focus fix to `webview/index.js`. Before touching a file, it restores it from `<name>.bak` if a backup already exists, so every run matches patterns against the pristine original rather than whatever a previous pass left behind — there's no separate "check first" step, and no harm in just running it repeatedly. Before its first-ever write to a given file, that pristine version is what gets saved as `<name>.bak` (never overwritten again), and the script's output tells you where it is and how to restore it.
+
+If a pattern can't be matched, nothing is written for that file — the extension bundle changed shape and `patch.py`'s patterns need updating. The unpatched file is copied into this repo's git-ignored `tmp/` directory (Claude Code's sandbox can't read `~/.vscode/extensions`/`~/.cursor/extensions` directly, but it *can* read this repo), so there's nothing to paste — just tell Claude a pattern wasn't found and it can read `tmp/` and take it from there.
 
 After a successful patch:
 

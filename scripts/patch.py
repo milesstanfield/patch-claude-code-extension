@@ -51,6 +51,19 @@ Before the first write to a given file, it is backed up to <name>.bak
 (never overwritten once it exists), so a patch can be undone with
 `python3 scripts/restore.py` (or manually: `cp extension.js.bak
 extension.js` / `cp webview/index.js.bak webview/index.js`).
+
+Every run restores a file from its .bak first (if one exists) before
+re-patching, so patterns are always matched against the pristine original
+rather than against whatever a previous pass left behind -- this is what
+makes "already patched" a live check instead of a stale assumption, and
+means it's always safe to just run this script after an update instead of
+checking first.
+
+If a pattern still can't be matched, nothing is written -- the file is left
+exactly as found, and it's copied into this repo's git-ignored tmp/
+directory (Claude Code's sandbox can't read ~/.vscode/extensions or
+~/.cursor/extensions directly, but it can read this repo) so Claude can
+inspect it directly and re-teach the pattern.
 """
 
 import re
@@ -62,6 +75,8 @@ EXTENSION_ROOTS = [
     Path.home() / ".cursor" / "extensions",
     Path.home() / ".vscode" / "extensions",
 ]
+
+TMP_DIR = Path(__file__).parent.parent / "tmp"
 
 # Every lock site is ultimately the same expression:
 # `{alias}.commands.executeCommand("workbench.action.lockEditorGroup")`.
@@ -224,6 +239,26 @@ def backup(extension_js: Path) -> Path:
     return bak
 
 
+def restore_if_backed_up(path: Path, parts: list[str]) -> None:
+    """Reset to the pristine .bak, if one exists, before patching.
+
+    Patterns are then always matched against the original file rather than
+    against however a previous pass left it -- so a stale or half-applied
+    state can never be mistaken for "already patched".
+    """
+    bak = path.with_suffix(path.suffix + ".bak")
+    if bak.is_file():
+        shutil.copy2(bak, path)
+        parts.append("restored from backup")
+
+
+def stash(path: Path, ext_dir_name: str, dest_name: str) -> Path:
+    dest = TMP_DIR / ext_dir_name / dest_name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, dest)
+    return dest
+
+
 def patch_lock(src: str, parts: list[str]) -> str:
     patched, count = LOCK_COMMAND_CALL.subn("Promise.resolve()", src)
     if count:
@@ -299,10 +334,10 @@ def patch_focus(src: str, parts: list[str]) -> str:
 
 
 def patch_extension_js(extension_js: Path) -> str:
-    src = extension_js.read_text()
-    original = src
     parts: list[str] = []
+    restore_if_backed_up(extension_js, parts)
 
+    src = original = extension_js.read_text()
     src = patch_lock(src, parts)
     src = patch_column(src, parts)
 
@@ -310,10 +345,10 @@ def patch_extension_js(extension_js: Path) -> str:
 
 
 def patch_webview_js(webview_js: Path) -> str:
-    src = webview_js.read_text()
-    original = src
     parts: list[str] = []
+    restore_if_backed_up(webview_js, parts)
 
+    src = original = webview_js.read_text()
     src = patch_focus(src, parts)
 
     return _finish(webview_js, original, src, parts, verify_webview_js(src))
@@ -362,8 +397,11 @@ def main() -> int:
             else:
                 found_any = True
                 result = patch_extension_js(extension_js)
+                if failed(result):
+                    failures += 1
+                    dest = stash(extension_js, ext_dir.name, "extension.js")
+                    result += f"; copied to {dest} for Claude"
                 print(f"{ext_dir.name} ({root}) extension.js: {result}")
-                failures += failed(result)
 
             webview_js = ext_dir / "webview" / "index.js"
             if not webview_js.is_file():
@@ -371,8 +409,11 @@ def main() -> int:
                 continue
             found_any = True
             result = patch_webview_js(webview_js)
+            if failed(result):
+                failures += 1
+                dest = stash(webview_js, ext_dir.name, "webview-index.js")
+                result += f"; copied to {dest} for Claude"
             print(f"{ext_dir.name} ({root}) webview/index.js: {result}")
-            failures += failed(result)
 
     if not found_any:
         print("No anthropic.claude-code-* extension installations found.")
@@ -382,9 +423,9 @@ def main() -> int:
         print(
             f"\n{failures} file(s) NOT PATCHED. The extension bundle changed shape and "
             "patch.py's patterns need updating -- nothing was written for those files, "
-            "so the install is exactly as it was.\n"
-            "Run `python3 scripts/sync_tmp.py` and tell Claude patching failed; it can "
-            "read the copies in tmp/ and re-teach the patterns."
+            "so the install is exactly as it was. The unpatched file(s) were copied into "
+            f"{TMP_DIR} -- tell Claude patching failed and it can read them directly and "
+            "re-teach the patterns."
         )
     else:
         print("\nAll fixes applied and verified. Fully quit VS Code/Cursor to load them.")
