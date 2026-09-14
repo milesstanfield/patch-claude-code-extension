@@ -6,15 +6,36 @@ reliably auto-focus the chat input when a new session opens.
 Three fixes, applied to every anthropic.claude-code-* install under
 ~/.cursor/extensions and ~/.vscode/extensions:
 
-1. Lock (extension.js): neutralize `workbench.action.lockEditorGroup` when
-   the panel opens (`if(X)` -> `if(X&&!1)`).
+1. Lock (extension.js): replace every
+   `{alias}.commands.executeCommand("workbench.action.lockEditorGroup")`
+   expression with `Promise.resolve()`. Earlier versions neutralized the
+   guarding condition instead (`if(X)` -> `if(X&&!1)`), which had to be
+   re-taught the statement's shape on every bundle change and, in 2.1.270,
+   silently missed the real one: the call had been hoisted into a helper
+   (`function d6$(){return h$.commands.executeCommand(...)}`) with three
+   callers, leaving only a rare inline site for the old pattern to "fix".
+   Killing the call expression itself covers every caller and every shape.
 2. Column (extension.js): replace the `findUnusedColumn()` /
    `ViewColumn.Beside` fallback used when no Claude Code panel is already
    open with `{alias}.ViewColumn.Active||1`, so "+ New session" lands as a
    new tab in whatever editor group is currently active instead of
    splitting a new column beside it. The minified vscode import alias
    varies by version (e.g. Tt, It, Rt, Nt, Lt, B4) and is detected from the
-   createWebviewPanel call that follows.
+   createWebviewPanel call that follows (v1 shape, through 2.1.268) or from
+   the `!==alias.ViewColumn.Beside` comparison in the same statement (v2
+   shape, 2.1.269+, after the fallback was rewritten into an if/else
+   chain).
+
+   The v2 shape also assigns the `startedInNewColumn` flag right after the
+   column choice (`{z}={w}!==alias.ViewColumn.Beside`), and that has to be
+   pinned to `!1` as part of the same edit. `ViewColumn.Active` is -1 and
+   `Beside` is -2, so swapping in Active while leaving the comparison alone
+   evaluates to true -- the patch ends up announcing "I opened a brand-new
+   column", which is precisely what fix 1 is trying to stop. (In 2.1.270 that
+   flag has no other consumer than the lock decision.) Left unpinned, the
+   two fixes fight: the active group gets locked, and because a locked group
+   can't accept new tabs, the *next* session is pushed into a separate group
+   of its own -- exactly the behavior the column fix exists to prevent.
 3. Focus (webview/index.js): the chat webview already tries to focus its
    input whenever the session id changes (including for a brand-new
    panel), but it's gated on `ambientFocusAllowed()` (= `document.hasFocus()`),
@@ -42,16 +63,26 @@ EXTENSION_ROOTS = [
     Path.home() / ".vscode" / "extensions",
 ]
 
-# Matches: if(E)await Pe.commands.executeCommand("workbench.action.lockEditorGroup")
-LOCK_CALL = re.compile(
-    r"if\((?P<cond>[A-Za-z$_][\w$]*)\)"
-    r'(?P<call>await [A-Za-z$_][\w$]*\.commands\.executeCommand\("workbench\.action\.lockEditorGroup"\))'
+# Every lock site is ultimately the same expression:
+# `{alias}.commands.executeCommand("workbench.action.lockEditorGroup")`.
+# Earlier versions of this script tried to neutralize the *condition* guarding
+# that call (`if(X)` -> `if(X&&!1)`), which meant chasing the shape of the
+# surrounding statement every time the bundle changed -- and silently missing
+# sites. 2.1.270 hoisted the call into a helper (`function d6$(){return
+# h$.commands.executeCommand("workbench.action.lockEditorGroup")}`) with three
+# callers, so condition-matching found only the one remaining inline site (a
+# rare remembered-tab-reveal failure path) and reported success while the
+# "+ New session" path kept locking.
+#
+# So: replace the call expression itself, everywhere it appears. The command
+# has exactly one purpose -- locking the group Claude Code opened -- so killing
+# all of them is what we want, and `Promise.resolve()` keeps every call site
+# valid whether it's awaited, returned, or neither.
+LOCK_COMMAND_CALL = re.compile(
+    r'[A-Za-z$_][\w$]*\.commands\.executeCommand\("workbench\.action\.lockEditorGroup"\)'
 )
 
-LOCK_ALREADY = re.compile(
-    r"if\([A-Za-z$_][\w$]*&&!1\)"
-    r'await [A-Za-z$_][\w$]*\.commands\.executeCommand\("workbench\.action\.lockEditorGroup"\)'
-)
+LOCK_COMMAND_NAME = "workbench.action.lockEditorGroup"
 
 # Matches the raw `this.findUnusedColumn()` call, the old
 # `{alias}.ViewColumn.Beside||1` form, or the already-patched
@@ -64,6 +95,36 @@ COLUMN_SITE = re.compile(
     r"|[A-Za-z$_][\w$]*\.ViewColumn\.Active\|\|1)"
     r"(?P<tail>,[A-Za-z$_][\w$]*=!0\}let [A-Za-z$_][\w$]*="
     r"(?P<alias>[A-Za-z$_][\w$]*)\.window\.createWebviewPanel)"
+)
+
+# 2.1.269+ rewrote the fallback into an if/else assignment chain (first try
+# reusing an existing tab via a helper call, only falling back to
+# findUnusedColumn() if that fails), which no longer ends in the old tail
+# shape. Anchored instead on the `!==<alias>.ViewColumn.Beside` comparison
+# that immediately follows the call in the same statement -- that's what
+# supplies the alias, so there's no need to reach forward to
+# createWebviewPanel like the v1 pattern does.
+#
+# The trailing `{z}={w}!==<alias>.ViewColumn.Beside` is the `startedInNewColumn`
+# flag, and it must be rewritten too, not just read for its alias. Verified in
+# 2.1.270 that this flag's ONLY consumer is the decision to lock the group, and
+# `ViewColumn.Active` is -1 while `Beside` is -2 -- so swapping in Active while
+# leaving the comparison alone leaves `z === true`, i.e. the patch itself tells
+# the extension "I opened a brand-new column, go lock it". Pin it to `!1`: once
+# the column is the active one, it is by definition not new.
+#
+# Also matches the half-patched shape (Active already swapped in, comparison
+# left intact) that older copies of this script produced, so those installs get
+# repaired rather than skipped as already patched.
+COLUMN_CALL_V2 = re.compile(
+    r"else (?P<w>[A-Za-z$_][\w$]*)=(?:this\.findUnusedColumn\(\)"
+    r"|[A-Za-z$_][\w$]*\.ViewColumn\.Active\|\|1),"
+    r"(?P<z>[A-Za-z$_][\w$]*)=(?P=w)!==(?P<alias>[A-Za-z$_][\w$]*)\.ViewColumn\.Beside"
+)
+
+COLUMN_ALREADY_V2 = re.compile(
+    r"else [A-Za-z$_][\w$]*=[A-Za-z$_][\w$]*\.ViewColumn\.Active\|\|1,"
+    r"[A-Za-z$_][\w$]*=!1"
 )
 
 # Matches the single-shot "focus the composer if the session id changed and
@@ -102,6 +163,52 @@ FOCUS_V2_ALREADY = re.compile(
 FOCUS_RETRY_DELAYS = "[50,150,300,600,1000,1600]"
 
 
+# --- Post-conditions ------------------------------------------------------
+#
+# A regex matching something is NOT evidence the fix took. In 2.1.270 the lock
+# call had been hoisted into a helper with three callers, and the old pattern
+# matched a leftover inline site on a path that effectively never runs -- so the
+# script reported "lock patched (1)" while "+ New session" kept locking the
+# group. Same class of failure on the column side: a pattern said "already
+# patched" while the startedInNewColumn flag was still wrong.
+#
+# So every fix states what must be TRUE of the finished file, and the result is
+# checked against that before anything is written. If a future bundle moves the
+# code again, these fail loudly instead of reporting a success that isn't real.
+
+# v1 patched shape (through 2.1.268): the fallback is the last thing before the
+# createWebviewPanel call. Its `=!0` flag is left alone -- harmless, since the
+# lock fix removes the only thing that reads it.
+COLUMN_PATCHED_V1 = re.compile(
+    r"[A-Za-z$_][\w$]*\.ViewColumn\.Active\|\|1,[A-Za-z$_][\w$]*=!0\}"
+    r"let [A-Za-z$_][\w$]*=[A-Za-z$_][\w$]*\.window\.createWebviewPanel"
+)
+
+
+def verify_extension_js(src: str) -> list[str]:
+    problems = []
+    if LOCK_COMMAND_NAME in src:
+        n = src.count(LOCK_COMMAND_NAME)
+        problems.append(
+            f"lock NOT NEUTRALIZED: {n} reference(s) to {LOCK_COMMAND_NAME} remain"
+        )
+    if "this.findUnusedColumn()" in src:
+        problems.append("column NOT REDIRECTED: a this.findUnusedColumn() call remains")
+    if not (COLUMN_PATCHED_V1.search(src) or COLUMN_ALREADY_V2.search(src)):
+        problems.append(
+            "column NOT REDIRECTED: no patched fallback found "
+            "(expected ViewColumn.Active with the new-column flag pinned to !1)"
+        )
+    return problems
+
+
+def verify_webview_js(src: str) -> list[str]:
+    problems = []
+    if not FOCUS_V2_ALREADY.search(src):
+        problems.append("focus NOT APPLIED: patched retry loop not found")
+    return problems
+
+
 def _focus_body(ref: str) -> str:
     return (
         f"let ccTry=()=>{ref}.current?.focus();ccTry();"
@@ -118,37 +225,49 @@ def backup(extension_js: Path) -> Path:
 
 
 def patch_lock(src: str, parts: list[str]) -> str:
-    if LOCK_ALREADY.search(src):
-        parts.append("lock already patched")
-        return src
-    patched, count = LOCK_CALL.subn(r"if(\g<cond>&&!1)\g<call>", src)
-    if count == 0:
+    patched, count = LOCK_COMMAND_CALL.subn("Promise.resolve()", src)
+    if count:
+        parts.append(f"lock patched ({count} call site(s))")
+        return patched
+    if LOCK_COMMAND_NAME in src:
         parts.append("lock PATTERN NOT FOUND")
         return src
-    parts.append(f"lock patched ({count})")
-    return patched
+    parts.append("lock already patched")
+    return src
 
 
 def patch_column(src: str, parts: list[str]) -> str:
     m = COLUMN_SITE.search(src)
-    if m is None:
-        parts.append("column PATTERN NOT FOUND")
-        return src
+    if m is not None:
+        alias = m.group("alias")
+        current = m.group(0)[: -len(m.group("tail"))]
+        desired = f"{alias}.ViewColumn.Active||1"
 
-    alias = m.group("alias")
-    current = m.group(0)[: -len(m.group("tail"))]
-    desired = f"{alias}.ViewColumn.Active||1"
+        if current == desired:
+            parts.append("column already patched")
+            return src
+        if len(current) != len(desired):
+            parts.append(f"column PATTERN NOT FOUND (alias {alias!r} wrong length)")
+            return src
 
-    if current == desired:
+        start = m.start()
+        parts.append(f"column patched ({alias}, was {current!r})")
+        return src[:start] + desired + src[start + len(current) :]
+
+    if COLUMN_ALREADY_V2.search(src):
         parts.append("column already patched")
         return src
-    if len(current) != len(desired):
-        parts.append(f"column PATTERN NOT FOUND (alias {alias!r} wrong length)")
-        return src
 
-    start = m.start()
-    parts.append(f"column patched ({alias}, was {current!r})")
-    return src[:start] + desired + src[start + len(current) :]
+    m2 = COLUMN_CALL_V2.search(src)
+    if m2 is not None:
+        alias, w, z = m2.group("alias"), m2.group("w"), m2.group("z")
+        start, end = m2.span()
+        replacement = f"else {w}={alias}.ViewColumn.Active||1,{z}=!1"
+        parts.append(f"column patched ({alias}, was {m2.group(0)!r})")
+        return src[:start] + replacement + src[end:]
+
+    parts.append("column PATTERN NOT FOUND")
+    return src
 
 
 def patch_focus(src: str, parts: list[str]) -> str:
@@ -187,12 +306,7 @@ def patch_extension_js(extension_js: Path) -> str:
     src = patch_lock(src, parts)
     src = patch_column(src, parts)
 
-    if src != original:
-        bak = backup(extension_js)
-        extension_js.write_text(src)
-        parts.append(f"backup at {bak} (restore with: python3 scripts/restore.py)")
-
-    return "; ".join(parts)
+    return _finish(extension_js, original, src, parts, verify_extension_js(src))
 
 
 def patch_webview_js(webview_js: Path) -> str:
@@ -202,12 +316,37 @@ def patch_webview_js(webview_js: Path) -> str:
 
     src = patch_focus(src, parts)
 
-    if src != original:
-        bak = backup(webview_js)
-        webview_js.write_text(src)
-        parts.append(f"backup at {bak} (restore with: python3 scripts/restore.py)")
+    return _finish(webview_js, original, src, parts, verify_webview_js(src))
 
+
+def _finish(
+    path: Path, original: str, src: str, parts: list[str], problems: list[str]
+) -> str:
+    """Write the patched file only if the result passes its post-conditions.
+
+    A failed check means the bundle moved and the patterns need re-teaching, so
+    the file is left exactly as found rather than written in a half-patched
+    state -- which is what made the last breakage hard to see.
+    """
+    if problems:
+        return "VERIFY FAILED -- not written: " + "; ".join(problems) + (
+            f" [patch step reported: {'; '.join(parts)}]" if parts else ""
+        )
+
+    if src != original:
+        bak = backup(path)
+        parts.append(f"backup at {bak} (restore with: python3 scripts/restore.py)")
+        path.write_text(src)
+
+    parts.append("VERIFIED")
     return "; ".join(parts)
+
+
+FAILED_MARKERS = ("NOT FOUND", "VERIFY FAILED")
+
+
+def failed(result: str) -> bool:
+    return any(marker in result for marker in FAILED_MARKERS)
 
 
 def main() -> int:
@@ -224,8 +363,7 @@ def main() -> int:
                 found_any = True
                 result = patch_extension_js(extension_js)
                 print(f"{ext_dir.name} ({root}) extension.js: {result}")
-                if "NOT FOUND" in result:
-                    failures += 1
+                failures += failed(result)
 
             webview_js = ext_dir / "webview" / "index.js"
             if not webview_js.is_file():
@@ -234,11 +372,22 @@ def main() -> int:
             found_any = True
             result = patch_webview_js(webview_js)
             print(f"{ext_dir.name} ({root}) webview/index.js: {result}")
-            if "NOT FOUND" in result:
-                failures += 1
+            failures += failed(result)
+
     if not found_any:
         print("No anthropic.claude-code-* extension installations found.")
         return 1
+
+    if failures:
+        print(
+            f"\n{failures} file(s) NOT PATCHED. The extension bundle changed shape and "
+            "patch.py's patterns need updating -- nothing was written for those files, "
+            "so the install is exactly as it was.\n"
+            "Run `python3 scripts/sync_tmp.py` and tell Claude patching failed; it can "
+            "read the copies in tmp/ and re-teach the patterns."
+        )
+    else:
+        print("\nAll fixes applied and verified. Fully quit VS Code/Cursor to load them.")
     return 1 if failures else 0
 
 
